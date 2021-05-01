@@ -1,0 +1,105 @@
+---
+# Purpose: CloudFormation Template to create KMS Keys for the application
+# This template is separate from the SAM Template because KMS Keys must be created first,
+# before the app is deployed, and KMS keys must be long-lived, not coupled to the application stack.
+# In the event that the application stack needs to be deleted and re-created, the KMS Keys
+# must be unmodified, in order to ensure continued ability to decrypt the encrypted values.
+
+AWSTemplateFormatVersion: 2010-09-09
+Description: SAM Service Accelerator KMS Keys
+
+# Input Parameters
+Parameters:
+  paramServiceName:
+    Type: String
+    Description: The name of your microservice/api, e.g. "sam-service-accelerator"
+
+Resources:
+  resKmsSecretsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Encryption key used by the SAM Service Accelerator to encrypt secrets
+      KeyPolicy:
+        Id: key-policy
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: "*"
+          - Sid: Allow access for Key Administrators
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action:
+              - kms:Create*
+              - kms:Describe*
+              - kms:Enable*
+              - kms:List*
+              - kms:Put*
+              - kms:Update*
+              - kms:Revoke*
+              - kms:Disable*
+              - kms:Get*
+              - kms:Delete*
+              - kms:TagResource
+              - kms:UntagResource
+              - kms:ScheduleKeyDeletion
+              - kms:CancelKeyDeletion
+            Resource: "*"
+          - Sid: Allow use of the key
+            Effect: Allow
+            Principal:
+              AWS:
+                - !Sub arn:aws:iam::${AWS::AccountId}:root # SETUP: Restrict this when deploying to prod environment
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: "*"
+
+  resKmsSecretsKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${paramServiceName}-secrets"
+      TargetKeyId: !Ref resKmsSecretsKey
+
+  resIamManagedPolicyDecryptSecrets:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "kms-decrypt-secrets-${paramServiceName}"
+      Description: Allow Decryption of KMS Secrets for the SAM Service Accelerator
+      Path: "/"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Action:
+              - kms:Decrypt
+              - kms:DescribeKey
+            Resource: !GetAtt resKmsSecretsKey.Arn
+          -
+            Effect: "Allow"
+            Action:
+              - ssm:GetParameter
+              - secretsmanager:GetSecretValue
+              - secretsmanager:DescribeSecret
+            Resource: "*"
+
+Outputs:
+  outKmsSecretsKey:
+    Description: Secrets Encryption Key
+    Value: !GetAtt resKmsSecretsKey.Arn
+    Export:
+      Name: !Sub "export-kms-${paramServiceName}"
+
+  outIamDecryptManagedPolicy:
+    Description: Managed Policy for Decrypting secrets
+    Value: !Ref resIamManagedPolicyDecryptSecrets
+    Export:
+      Name: !Sub "export-iam-decrypt-managed-policy-${paramServiceName}"

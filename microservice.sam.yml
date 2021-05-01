@@ -1,0 +1,525 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform:
+- AWS::Serverless-2016-10-31
+- AWS::CodeStar
+Description: Penguin Bitbucket
+Parameters:
+  paramEnvironment:
+    Type: String
+    Description: Which environment do you want to deploy to? (local,dev,stage, or prod)
+    AllowedValues:
+      - local
+      - dev
+      - stage
+      - prod
+    Default: local
+  paramFeatureBranch:
+    Type: String
+    Description: Provide the name of the feature branch if this in not a build from the master code branch.
+    Default: ''
+  paramServiceName:
+    Type: String
+    Description: The name of the service
+    Default: penguin
+  paramReleaseVersion:
+    Type: String
+    Description: The Release Version number
+    Default: 0.0.1
+  paramBuildBasePath:
+    Type: String
+    Description: Option to build the API Gateway Base Path Mapping (requires a Custom Domain to be pre-configured)
+    AllowedValues:
+      - yes
+      - no
+    Default: yes
+  paramLogRetention:
+    Type: Number
+    Description: Number of days to keep logs
+    Default: 30
+  paramEnvironmentDomain:
+    Type: String
+    Description: The URL domain for the given environment, e.g. "tbd"
+    Default: tbd
+  paramMariaDBhost:
+    Type: String
+    Description: The host info for MariaDB connection.
+    Default: mariadb
+  paramMariaDBport:
+    Type: String
+    Description: The port info for MariaDB connection.
+    Default: 3306
+  paramMariaDBuser:
+    Type: String
+    Description: The user info for MariaDB connection.
+    Default: root
+  paramMariaAppuser:
+    Type: String
+    Description: The user info for MariaDB connection.
+    Default: sysmeta_app
+  paramMariaDBpassword:
+    Type: String
+    Description: The password info for MariaDB connection.
+    Default: pXoIDjFh5bL188a9
+  paramMariaApppassword:
+    Type: String
+    Description: The password info for MariaDB connection.
+    Default: ''
+  paramMariaDBdatabase:
+    Type: String
+    Description: The database info for MariaDB connection.
+    Default: systemmeta
+  paramLambdaSecurityGroupId:
+    Type: String
+    Description: The Id of security group lambda use
+    Default: tbd
+  paramLambdaSubnetId1:
+    Type: String
+    Description: The Id of subnet lambda will be on
+    Default: tbd
+  paramLambdaSubnetId2:
+    Type: String
+    Description: The Id of subnet lambda will be on
+    Default: tbd
+  paramAcmCertificateArn:
+    Type: String
+    Description: ACM Cert Arn, which must be created in us-east-1 region
+  paramHostedZone:
+    Type: String
+    Description: The name of the Route53 Hosted Zone for this domain (must be terminated with a period ".")
+  paramKmsKeyArn:
+    Type: String
+    Description: The arn of kmsKey lambda will be on
+    Default: ''
+  paramApiBaseUrlSecurity:
+    Type: String
+    Description: The base url of session api (default is mockserver url)
+    Default: 'http://docker.for.mac.localhost:3200/mockserver/security'
+Conditions:
+  conditionIsProd: !Equals [!Ref paramEnvironment, prod]
+  conditionIsStage: !Equals [!Ref paramEnvironment, stage]
+  condNotFeatureBranch: !Equals [!Ref paramFeatureBranch, '']
+  conditionBuildBasePath: !Equals [!Ref paramBuildBasePath, yes]
+  conditionIsAppUser: !Or [Condition: conditionIsProd, Condition: conditionIsStage]
+
+Globals:
+  Function:
+    # Properties of AWS::Serverless::Function
+    Runtime: nodejs12.x
+    MemorySize: 512
+    Timeout: 30
+    Environment:
+      Variables:
+        serviceName: !Ref paramServiceName
+        environmentName: !Ref paramEnvironment
+        releaseVersion: !Ref paramReleaseVersion
+        logLevel: info
+        mairaDBhost: !Ref paramMariaDBhost
+        mairaDBport: !Ref paramMariaDBport
+        mairaDBuser: !If [conditionIsAppUser, !Ref paramMariaAppuser, !Ref paramMariaDBuser]
+        mairaDBpassword: !If [conditionIsAppUser, !Ref paramMariaApppassword, !Ref paramMariaDBpassword]
+        mairaDBdatabase: !Ref paramMariaDBdatabase
+        apiBaseUrlSecurity: !Ref paramApiBaseUrlSecurity
+    Tags:
+      Application: !Ref paramServiceName
+      Environment: !Ref paramEnvironment
+
+Resources:
+  restApiAuthorizerRoleMember:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal: 
+              Service: 'apigateway.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: lambda
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              -
+                Effect: 'Allow'
+                Action: 'lambda:invokeFunction'
+                Resource: '*'
+
+  # Lambda Function Definitions
+  ### resLambdaHealthGet: This first function is intended to be a health endpoint for semantic monitoring
+  ### Extend the code for this function as you add new external dependencies like databases or external api requests
+  resLambdaHealthGet: # Name each lambda logical id something unique to this template
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: HealthGet.handler # Use the filename for the handler, e.g. [filename].handler
+      FunctionName: !Sub '${paramEnvironment}${paramFeatureBranch}_${paramServiceName}_HealthGet' # Use the same filename in the function name here
+      CodeUri: dist # We set the CodeUri to "dist" so that this same config works for both deployed code and local emulation
+      KmsKeyArn: !Ref paramKmsKeyArn
+      Policies:
+        # - Fn::ImportValue: # This policy is needed to access the secrets created by the KMS yml file
+        #     !Sub "export-iam-decrypt-managed-policy-${paramServiceName}"
+      Events:
+        HealthGet:
+          Type: Api
+          Properties:
+            RestApiId: !Ref resApiGateway
+            Path: /health # Unique URL path to hit this endpoint
+            Method: GET # HTTP Method to be used to hit this endpoint
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref paramLambdaSecurityGroupId
+        SubnetIds:
+          - !Ref paramLambdaSubnetId1
+          - !Ref paramLambdaSubnetId2
+
+  ### resLambdaCommonCodeGet: This lambda function is intended to be an example of how to request data from MariaDB
+  ### Keep this function and adapt it if you use MariaDB as a datasource. Copy it to create more MariaDB endpoints.
+  resLambdaCommonCodeGet:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: CommonCodeGet.handler
+      FunctionName: !Sub '${paramEnvironment}${paramFeatureBranch}_${paramServiceName}_CommonCodeGet'
+      CodeUri: dist
+      KmsKeyArn: !Ref paramKmsKeyArn
+      Policies:
+        # - Fn::ImportValue: # This policy is needed to access the secrets created by the KMS yml file
+        # !Sub "export-iam-decrypt-managed-policy-${paramServiceName}"
+        - VPCAccessPolicy: {}
+      Events:
+        CommonCodeGet:
+          Type: Api
+          Properties:
+            RestApiId: !Ref resApiGateway
+            Path: /v1/commonCode
+            Method: GET
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref paramLambdaSecurityGroupId
+        SubnetIds:
+          - !Ref paramLambdaSubnetId1
+          - !Ref paramLambdaSubnetId2
+
+  # Log Groups
+  ### Defining log groups like this allows for two main objectives:
+  ### A) Log retention is set so that old log entries are removed
+  ### B) Log groups and all logs are deleted when the CloudFormation stack is deleted
+
+  resLambdaHealthGetLogGroup:
+    Type: AWS::Logs::LogGroup
+    DependsOn: resLambdaHealthGet
+    Properties:
+      RetentionInDays: !Ref paramLogRetention
+      LogGroupName: !Sub '/aws/lambda/${resLambdaHealthGet}'
+
+  resLambdaCommonCodeGetLogGroup:
+    Type: AWS::Logs::LogGroup
+    DependsOn: resLambdaCommonCodeGet
+    Properties:
+      RetentionInDays: !Ref paramLogRetention
+      LogGroupName: !Sub '/aws/lambda/${resLambdaCommonCodeGet}'
+
+  # API Gateway definition
+  # Explicitly defining an API Gateway in SAM is optional, but doing so
+  # gives us a lot more flexibility in configuring the features of the API Gateway
+  # SAM local tools have support for CFT intrinsic functions, so we can reference
+  # the Lambda function's logical ID using ${resLambdaGet.Arn}
+
+  # The decision to use an inline Swagger body instead of using a separate the DefinitionUri property
+  # is because SAM Local doesn't support the AWS:Include function yet
+  resApiGateway:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: !Sub '${paramEnvironment}'
+      Cors:
+        AllowMethods: "'GET,POST,PUT,DELETE,PATCH'"
+        AllowHeaders: "'Date,Accept,Accept-Charset,X-Correlation-Id,X-VPORTAL-APIKEY,X-Language-Code,Content-Type,X-Amz-Date,Authorization,X-Api-Key,correlation-object,x-amz-security-token,X-Session-Id,X-Session-Info'"
+        AllowOrigin: "'*'"
+      MethodSettings:
+        - LoggingLevel: 'INFO' # In order to enable API Gateway logging, permissions must be setup: https://aws.amazon.com/premiumsupport/knowledge-center/api-gateway-cloudwatch-logs/
+          MetricsEnabled: True
+          DataTraceEnabled: True
+          ResourcePath: '/*'
+          HttpMethod: '*'
+      DefinitionBody:
+        swagger: '2.0'
+        basePath: !Sub '/${paramServiceName}'
+        info:
+          title: !Sub '${paramEnvironment} ${paramServiceName} ${paramFeatureBranch}'
+          description: Penguin's app accelerator for SAM APIs
+          version: 0.0.1
+        schemes:
+          - https
+        produces:
+          - application/json
+        tags:
+          - name: 'health'
+            description: 'Health Check'
+        paths:
+          /health:
+            get:
+              security:
+                - NONE: []
+              produces:
+                - application/json
+              tags:
+                - 'health'
+              summary: Ping the service for health status
+              responses:
+                '200':
+                  description: The status summary of all the services
+                  schema:
+                    '$ref': '#/definitions/HealthStatusResponse'
+                '500':
+                  description: Internal Server Error
+                  schema:
+                    '$ref': '#/definitions/Error'
+                '504':
+                  description: Internal Server Error
+                  schema:
+                    '$ref': '#/definitions/Error'
+              x-amazon-apigateway-integration:
+                responses:
+                  default:
+                    statusCode: '200'
+                uri:
+                  Fn::Sub: 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${resLambdaHealthGet.Arn}/invocations'
+                passthroughBehavior: when_no_match
+                httpMethod: POST
+                type: aws_proxy
+   
+          /v1/commonCode:
+            get:
+              security:
+                - NONE: []
+              produces:
+                - application/json
+              tags:
+                - 'commonCode'
+              summary: Get a common code
+              parameters:
+                - in: 'query'
+                  name: 'groupCodeId'
+                  description: 'Group Code ID'
+                  type: 'string'
+                - in: 'query'
+                  name: 'languageCode'
+                  description: 'Language Code'
+                  type: 'string'
+              responses:
+                '200':
+                  description: Return a common code
+                  schema:
+                    '$ref': '#/definitions/CommonCodeResponse'
+                '500':
+                  description: Internal Server Error
+                  schema:
+                    '$ref': '#/definitions/Error'
+                '504':
+                  description: Internal Server Error
+                  schema:
+                    '$ref': '#/definitions/Error'
+              x-amazon-apigateway-integration:
+                # cacheKeyParameters: ['method.request.querystring.groupCodeId']
+                responses:
+                  default:
+                    statusCode: '200'
+                uri:
+                  Fn::Sub: 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${resLambdaCommonCodeGet.Arn}/invocations'
+                passthroughBehavior: when_no_match
+                httpMethod: POST
+                type: aws_proxy
+
+        definitions:
+          Empty:
+            type: object
+            title: Empty Schema
+          HealthStatusResponse:
+            type: object
+            properties:
+              result:
+                '$ref': '#/definitions/HealthStatus'
+            required:
+              - result
+          TransactionResult:
+            type: object
+            properties:
+              result:
+                '$ref': '#/definitions/TransactionResultModel'
+            required:
+              - result
+          Error:
+            type: object
+            properties:
+              errorCode:
+                type: integer
+                format: int32
+              message:
+                type: string
+              data:
+                type: object
+          HealthStatus:
+            type: object
+            properties:
+              status:
+                type: string
+              executionTime:
+                type: integer
+                format: int32
+              errors:
+                type: array
+          TransactionResultModel:
+            type: object
+            properties:
+              affectedRows:
+                type: integer
+                format: int32
+              insertId:
+                type: integer
+                format: int32
+              warningStatus:
+                type: integer
+                format: int32
+          CommonCode:
+            type: object
+            properties:
+              codeName:
+                type: string
+              codeId:
+                type: string
+              groupCodeId:
+                type: string
+              languageCode:
+                type: string
+              
+        x-amazon-apigateway-gateway-responses:
+          UNAUTHORIZED:
+            statusCode: 401
+            responseParameters:
+              gatewayresponse.header.Access-Control-Expose-Headers: "'*'"
+              gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+            responseTemplates:
+              application/json: '{"message":$context.error.messageString}'
+              
+          MISSING_AUTHENTICATION_TOKEN:
+            statusCode: 401
+            responseParameters:
+              gatewayresponse.header.Access-Control-Expose-Headers: "'*'"
+              gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+            responseTemplates:
+              application/json: '{"message":$context.error.messageString}'
+          
+          ACCESS_DENIED:
+            statusCode: 401
+            responseParameters:
+              gatewayresponse.header.Access-Control-Expose-Headers: "'*'"
+              gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+            responseTemplates:
+              application/json: '{"message":$context.error.messageString}'
+
+          AUTHORIZER_FAILURE:
+            statusCode: 401
+            responseParameters:
+              gatewayresponse.header.Access-Control-Expose-Headers: "'*'"
+              gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+            responseTemplates:
+              application/json: '{"message":$context.error.messageString}'
+
+          AUTHORIZER_CONFIGURATION_ERROR:
+            statusCode: 401
+            responseParameters:
+              gatewayresponse.header.Access-Control-Expose-Headers: "'*'"
+              gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+            responseTemplates:
+              application/json: '{"message":$context.error.messageString}'
+
+          MISSING_AUTHENTICATION_TOKEN:
+            statusCode: 401
+            responseParameters:
+              gatewayresponse.header.Access-Control-Expose-Headers: "'*'"
+              gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+            responseTemplates:
+              application/json: '{"message":$context.error.messageString}'
+
+          INVALID_SIGNATURE:
+            statusCode: 401
+            responseParameters:
+              gatewayresponse.header.Access-Control-Expose-Headers: "'*'"
+              gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+            responseTemplates:
+              application/json: '{"message":$context.error.messageString}'
+
+          EXPIRED_TOKEN:
+            statusCode: 401
+            responseParameters:
+              gatewayresponse.header.Access-Control-Expose-Headers: "'*'"
+              gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+            responseTemplates:
+              application/json: '{"message":$context.error.messageString}'
+
+          DEFAULT_5XX:
+            statusCode: 499
+            responseParameters:
+              gatewayresponse.header.Access-Control-Expose-Headers: "'*'"
+              gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+            responseTemplates:
+              application/json: '{"message":$context.error.messageString}' 
+
+  # The BasePathMapping will fail if there is not a "Custom Domain Name" configured in the API Gateway Console. See README.md for details.
+  # This can be disabled by removing this resource. You will then need to get the API Gateway's stage url from the API Gateway resource.
+#   resApiGatewayCustomDomainName:
+#     Type: 'AWS::ApiGateway::DomainName'
+#     Properties:
+#       CertificateArn: !Ref paramAcmCertificateArn
+#       DomainName: !Ref paramEnvironmentDomain
+#       SecurityPolicy: 'TLS_1_2'
+
+#   resAPIBasePathMapping:
+#     Type: AWS::ApiGateway::BasePathMapping
+#     Condition: conditionBuildBasePath
+#     DependsOn: 'resApiGatewayStage'
+#     Properties:
+#       # BasePath: !If
+#       #   - condNotFeatureBranch
+#       #   - !Sub '${paramServiceName}'
+#       #   - !Sub '${paramServiceName}-${paramFeatureBranch}'
+#       DomainName: !Ref paramEnvironmentDomain
+#       RestApiId: !Ref resApiGateway
+#       Stage: !Ref paramEnvironment
+
+#   resRoute53RecordSet:
+#     Type: 'AWS::Route53::RecordSet'
+#     Properties:
+#       AliasTarget:
+#         DNSName: !GetAtt resApiGatewayCustomDomainName.DistributionDomainName
+#         HostedZoneId: Z2FDTNDATAQYW2 # This ID is used for all CloudFront domains
+#       HostedZoneId: !Ref paramHostedZone
+#       Name: !Ref paramEnvironmentDomain
+#       Type: A
+
+# Outputs:
+#   ApiId:
+#     Description: Unique API identifier
+#     Value: !Ref resApiGateway
+#   ApiUrl:
+#     Description: API base URL
+#     Value: !If
+#       - conditionBuildBasePath
+#       - !Join
+#         - ''
+#         - - 'https://'
+#           - !Ref paramEnvironmentDomain
+#       - !Sub 'https://${resApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${paramEnvironment}'
+
+#   ApiHealthEndpoint:
+#     Description: Specific URL for the health endpoint
+#     Value: !If
+#       - conditionBuildBasePath
+#       - !Join
+#         - ''
+#         - - 'https://'
+#           - !Ref paramEnvironmentDomain
+#           - !If
+#             - condNotFeatureBranch
+#             - !Sub '/${paramServiceName}/health'
+#             - !Sub '/${paramServiceName}-${paramFeatureBranch}/health'
+#       - !Sub 'https://${resApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${paramEnvironment}'

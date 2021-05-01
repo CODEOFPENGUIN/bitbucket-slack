@@ -1,0 +1,48 @@
+---
+# Purpose: CloudFormation Template to create API Gateway Custom Domain Name and Route 53 Record Set
+# This template is separate from the SAM Template because it can be shared across multiple microservices.
+# Required prework: Route53 Hosted Zone must be created; ACM Cert must be created in the us-east-1 region.
+
+AWSTemplateFormatVersion: 2010-09-09
+Description: SAM Service Accelerator API Gateway Custom Domain Name
+
+Parameters:
+  paramEnvironment:
+    Type: String
+    Description: Which environment do you want to deploy to? (dev, stage, or prod)
+    AllowedValues:
+    - dev
+    - stage
+    - prod
+    Default: dev
+  paramDomainName:
+    Type: String
+    Description: The full domain for the API Gateway
+  paramHostedZone:
+    Type: String
+    Description: The name of the Route53 Hosted Zone for this domain (must be terminated with a period ".")
+  paramAcmCertificateArn:
+    Type: String
+    Description: ACM Cert Arn, which must be created in us-east-1 region
+Resources:
+  resApiGatewayCustomDomainName:
+    Type: "AWS::ApiGateway::DomainName"
+    Properties:
+      CertificateArn: !Ref paramAcmCertificateArn
+      DomainName: !Ref paramDomainName
+
+  resRoute53RecordSet:
+    Type: "AWS::Route53::RecordSet"
+    Properties:
+      AliasTarget:
+        DNSName: !GetAtt resApiGatewayCustomDomainName.DistributionDomainName
+        HostedZoneId: Z2FDTNDATAQYW2  # This ID is used for all CloudFront domains
+      HostedZoneName: !Ref paramHostedZone
+      Name: !Ref paramDomainName
+      Type: A
+
+Outputs:
+  outDomainName:
+    Value: !Ref paramDomainName
+    Export:
+      Name: !Sub exportApiGatewayCustomDomainName-${paramEnvironment}

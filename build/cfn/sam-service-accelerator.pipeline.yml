@@ -1,0 +1,392 @@
+---
+# Purpose: CloudFormation Template to create build pipeline related resources
+# This template is separate from the SAM Template because the pipeline stack exists once for the app,
+# whereas the SAM template gets deployed for each code branch
+#
+# SETUP: Before deploying this stack, you will need to manually connect AWS CodeBuild to your source provider.
+#   This is most easily done through the AWS Console:
+#      https://docs.aws.amazon.com/codebuild/latest/APIReference/API_ProjectSource.html
+#
+# SETUP: After deploying this stack, you can use the "${paramServiceName}-pipeline" Managed Policy to allow permission
+#   for your CI/CD tools to perform the operations they need.
+#   For example, if you are using Jenkins or Bitbucket Pipelines,
+#       create an IAM User with an Access Key and assign it the ${paramServiceName}-pipeline Managed Policy.
+#   If you are using CodeBuild for CI/CD, then all of the needed access is created in this template,
+#       however, there is one manual step required to get the CI CodeBuild project running:
+#       1) Go into the AWS CodeBuild console, select the project named ${paramServiceName}-ci,
+#       2) Edit the "Source" section of the project
+#       3) Check the "Webhook" option labelled "Rebuild every time a code change is pushed to this repository"
+#           (Note that the Console interface changes frequently, the exact text may be different.)
+
+AWSTemplateFormatVersion: 2010-09-09
+Description: Sam Service Accelerator Pipeline Resources
+
+# Input Parameters
+Parameters:
+  paramServiceName:
+    Type: String
+    Description: The name of your microservice/api, e.g. "lg-service-accelerator"
+  paramSourceCodeRepo:
+    Type: String
+    Description: The complete git repo URI for your source code, e.g. "https://wire.lgcns.com/bitbucket/scm/bc/lg-accelerator-lambda.git"
+  paramSourceCodeRepoType:
+    Type: String
+    Description: The source repository provider. Only tested with "BITBUCKET", "GITHUB", and "CODECOMMIT"
+    AllowedValues:
+      - BITBUCKET
+      - CODECOMMIT
+      - GITHUB
+  paramBuildArtifactsBucketName:
+    Type: String
+    Description: The name of the S3 Bucket where build artifacts will be stored.
+  paramKmsKeyArn:
+    Type: String
+    Description: The complete ARN of the KMS key used to encrypt secrets used by the build system.
+
+Conditions:
+  condUseCodeCommit: !Equals [!Ref paramSourceCodeRepoType, 'CODECOMMIT']
+
+Resources:
+  # IAM Managed Policies
+
+  # SETUP: Assign the following Managed Policy to your IAM User or Role that executes CI tasks,
+  # such as "bitbucket-service-account" or "jenkins-service-account"
+  resIamManagedPolicyPipeline:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub '${paramServiceName}-pipeline'
+      Description: Allow automated build process to execute the build and deploy commands
+      Path: '/'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Action: # SETUP - Add any other IAM permissions needed for your specific service
+              - logs:*
+              - apigateway:*
+              - apigateway:DELETE
+              - cloudformation:CancelUpdateStack
+              - cloudformation:ContinueUpdateRollback
+              - cloudformation:CreateChangeSet
+              - cloudformation:CreateStack
+              - cloudformation:CreateUploadBucket
+              - cloudformation:DeleteStack
+              - cloudformation:DescribeChangeSet
+              - cloudformation:ExecuteChangeSet
+              - cloudformation:DescribeStackEvents
+              - cloudformation:DescribeStackResource
+              - cloudformation:DescribeStackResources
+              - cloudformation:DescribeStacks
+              - cloudformation:GetStackPolicy
+              - cloudformation:GetTemplate
+              - cloudformation:GetTemplateSummary
+              - cloudformation:ListStackResources
+              - cloudformation:ListStacks
+              - cloudformation:SetStackPolicy
+              - cloudformation:UpdateStack
+              - cloudformation:UpdateTerminationProtection
+              - cloudformation:ValidateTemplate
+              - codebuild:StopBuild # Used only if using CodeBuild as the CI tool
+              - dynamodb:CreateTable
+              - dynamodb:DeleteTable
+              - dynamodb:DescribeContinuousBackups
+              - dynamodb:DescribeTable
+              - dynamodb:ListTables
+              - dynamodb:TagResource
+              - dynamodb:ListTagsOfResource
+              - dynamodb:UpdateContinuousBackups
+              - dynamodb:UpdateTable
+              - dynamodb:UntagResource
+              - ec2:DescribeNetworkInterfaces # For VPC-enabled lambda functions
+              - iam:AttachRolePolicy
+              - iam:CreateRole
+              - iam:CreateRolePolicy
+              - iam:DeleteRole
+              - iam:DeleteRolePolicy
+              - iam:DetachRolePolicy
+              - iam:GetRole
+              - iam:ListPolicies
+              - iam:PassRole
+              - iam:PutRolePolicy
+              - iam:UpdateRole
+              - iam:UpdateRolePolicy
+              - lambda:AddPermission
+              - lambda:CreateAlias
+              - lambda:CreateFunction
+              - lambda:CreatePermission
+              - lambda:DeleteAlias
+              - lambda:DeleteFunction
+              - lambda:GetFunction
+              - lambda:GetFunctionConfiguration
+              - lambda:ListTags
+              - lambda:RemovePermission
+              - lambda:TagResource
+              - lambda:UntagResource
+              - lambda:UpdateAlias
+              - lambda:UpdateFunction
+              - lambda:UpdateFunctionCode
+              - lambda:UpdateFunctionConfiguration
+              - lambda:UpdatePermission
+              - route53:ChangeResourceRecordSets
+              - route53:ChangeTagsForResource
+              - route53:CreateHealthCheck
+              - route53:DeleteHealthCheck
+              - route53:GetChange
+              - route53:ListHostedZones
+              - route53:ListResourceRecordSets
+              - s3:Delete*
+              - s3:GetObject
+              - s3:ListAllMyBuckets
+              - s3:ListBucket
+              - s3:ListBuckets
+              - s3:ListObjects
+              - s3:Put*
+              - sns:CreateTopic
+              - sns:DeleteTopic
+              - sns:GetTopicAttributes
+              - sns:ListSubscriptionsByTopic
+              - sns:ListTopics
+              - sns:SetTopicAttributes
+              - sns:Subscribe
+              - sns:Unsubscribe
+              - ssm:GetParameter
+            Effect: Allow
+            Resource: '*'
+
+  # IAM Roles
+  resIamRoleCloudWatchTriggers:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: ['sts:AssumeRole']
+            Effect: Allow
+            Principal:
+              Service: [events.amazonaws.com]
+        Version: '2012-10-17'
+      Path: /
+      Policies:
+        - PolicyName: CodeBuildTriggers
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                  - codebuild:StartBuild
+                Effect: Allow
+                Resource: !GetAtt resCodeBuildCleanup.Arn
+
+  resIamRoleCodeBuildCleanup:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: ['sts:AssumeRole']
+            Effect: Allow
+            Principal:
+              Service: [codebuild.amazonaws.com]
+        Version: '2012-10-17'
+      Path: /
+      Policies:
+        - PolicyName: CodeBuildCleanup
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action: # SETUP - Add any other IAM permissions needed for your specific service
+                  - logs:*
+                  - cloudformation:DeleteStack
+                  - cloudformation:DescribeStackResource
+                  - cloudformation:DescribeStackResources
+                  - cloudformation:DescribeStacks
+                  - cloudformation:ListStackResources
+                  - cloudformation:ListStacks
+                  - dynamodb:DeleteTable
+                  - dynamodb:DescribeTable
+                  - dynamodb:ListTables
+                  - dynamodb:UntagResource
+                  - iam:DeleteRole
+                  - iam:DeleteRolePolicy
+                  - iam:DetachRolePolicy
+                  - lambda:DeleteFunction
+                  - lambda:DeleteAlias
+                  - lambda:RemovePermission
+                  - apigateway:DELETE
+                  - ec2:DescribeNetworkInterfaces
+                  - states:DeleteActivity
+                  - states:DeleteStateMachine
+                  - route53:ChangeResourceRecordSets
+                  - route53:ChangeTagsForResource
+                  - route53:DeleteHealthCheck
+                  - route53:GetChange
+                  - route53:ListHostedZones
+                  - route53:ListResourceRecordSets
+                  - sns:DeleteTopic
+                  - sns:GetTopicAttributes
+                  - sns:ListSubscriptionsByTopic
+                  - sns:ListTopics
+                  - sns:Unsubscribe
+                Effect: Allow
+                Resource: '*'
+
+  resIamRoleCodeBuildContinuousIntegration:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: ['sts:AssumeRole']
+            Effect: Allow
+            Principal:
+              Service: [codebuild.amazonaws.com]
+        Version: '2012-10-17'
+      Path: /
+      ManagedPolicyArns:
+        - !Ref resIamManagedPolicyPipeline
+      Policies:
+        - PolicyName: KmsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - kms:Decrypt
+                  - kms:DescribeKey
+                Resource: !Ref paramKmsKeyArn
+              - Effect: 'Allow'
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                Resource: '*'
+
+  # CloudWatch Event Rules
+  resCloudWatchEventRuleDailyCleanup:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${paramServiceName}-feature-branch-cleanup'
+      Description: !Sub 'Triggers the CodeBuild job named ${paramServiceName}-feature-branch-cleanup'
+      ScheduleExpression: 'rate(1 day)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt resCodeBuildCleanup.Arn
+          Id: !Ref resCodeBuildCleanup
+          RoleArn: !GetAtt resIamRoleCloudWatchTriggers.Arn
+
+  # CodeCommit Repo [optional]
+  resCodeCommitRepo:
+    Type: 'AWS::CodeCommit::Repository'
+    Condition: condUseCodeCommit
+    Properties:
+      RepositoryName: !Ref paramServiceName
+      RepositoryDescription: Microservice template for serverless architecture
+
+  # CodeBuild Projects
+  resCodeBuildCleanup:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${paramServiceName}-feature-branch-cleanup'
+      Description: Scans source code repo and deletes AWS resources for feature branches that no longer exist
+      ServiceRole: !GetAtt resIamRoleCodeBuildCleanup.Arn
+      Artifacts:
+        Type: no_artifacts
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/nodejs:10.14.1
+      Source:
+        Type: !Ref paramSourceCodeRepoType
+        Auth: !If
+          - condUseCodeCommit
+          - !Ref AWS::NoValue # No Auth value for CodeCommit
+          - Type: OAUTH
+        Location: !If
+          - condUseCodeCommit
+          - !GetAtt resCodeCommitRepo.CloneUrlHttp
+          - !Ref paramSourceCodeRepo
+        BuildSpec: build/codebuild/feature-branch-cleanup.buildspec.yml
+        GitCloneDepth: 0
+      TimeoutInMinutes: 10
+      Tags:
+        - Key: Application
+          Value: !Ref paramServiceName
+
+  resCodeBuildContinuousIntegration:
+    Type: 'AWS::CodeBuild::Project'
+    Properties:
+      Name: !Sub '${paramServiceName}-ci'
+      Description: Builds the Serverless project on every push to the repo
+      ServiceRole: !GetAtt resIamRoleCodeBuildContinuousIntegration.Arn
+      Artifacts:
+        Type: no_artifacts
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/nodejs:10.14.1
+        EnvironmentVariables:
+          - Name: ARTIFACTS_BUCKET
+            Value: !Ref paramBuildArtifactsBucketName
+      Source:
+        Type: !Ref paramSourceCodeRepoType
+        Auth: !If
+          - condUseCodeCommit
+          - !Ref AWS::NoValue # No Auth value for CodeCommit
+          - Type: OAUTH
+        Location: !If
+          - condUseCodeCommit
+          - !GetAtt resCodeCommitRepo.CloneUrlHttp
+          - !Ref paramSourceCodeRepo
+        BuildSpec: build/codebuild/ci.buildspec.yml
+        GitCloneDepth: 0 # Need full clone to get full history of git tags
+        ReportBuildStatus: true
+      TimeoutInMinutes: 10
+      Triggers:
+        FilterGroups:
+          - - Type: EVENT
+              Pattern: PUSH
+              ExcludeMatchedPattern: false
+            - Type: HEAD_REF
+              Pattern: '^refs/tags/.*'
+              ExcludeMatchedPattern: true
+        Webhook: true
+      Tags:
+        - Key: Application
+          Value: !Ref paramServiceName
+
+  resCodeBuildProd:
+    Type: 'AWS::CodeBuild::Project'
+    Properties:
+      Name: !Sub '${paramServiceName}-prod'
+      Description: Deploys the build artifacts to the prod environment
+      ServiceRole: !GetAtt resIamRoleCodeBuildContinuousIntegration.Arn
+      Artifacts:
+        Type: no_artifacts
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/nodejs:10.14.1
+        EnvironmentVariables:
+          - Name: VERSION
+            Value: 'v-'
+          - Name: ENVIRONMENT
+            Value: prod
+          - Name: APP_NAME
+            Value: !Ref paramServiceName
+          - Name: ARTIFACTS_BUCKET
+            Value: !Ref paramBuildArtifactsBucketName
+      Source:
+        Type: !Ref paramSourceCodeRepoType
+        Auth:
+          Type: OAUTH
+        Location: !Ref paramSourceCodeRepo
+        BuildSpec: build/codebuild/deploy.buildspec.yml
+        GitCloneDepth: 1
+        ReportBuildStatus: true
+      TimeoutInMinutes: 10
+      Tags:
+        - Key: Application
+          Value: !Ref paramServiceName
+
+Outputs:
+  outIamRoleCodeBuildContinuousIntegration:
+    Description: IAM Role used to execute the CI/CD process
+    Value: !GetAtt resIamRoleCodeBuildContinuousIntegration.Arn
+    Export:
+      Name: !Sub '${paramServiceName}-ci-iam-role-arn'

@@ -1,0 +1,30 @@
+---
+extends: '@istanbuljs/nyc-config-typescript'
+all: true
+check-coverage: true
+extension:
+  - '.ts'
+exclude:
+  - src/**/*.spec.ts
+  - build
+  - config
+  - coverage
+  - dist
+  - node_modules
+  - src/_lambda-handlers
+  - src/config
+  - src/helpers
+  - src/models
+  - src/repositories
+  - src/mock
+include:
+  - src/**/*.ts
+reporter:
+  - html
+  - text
+sourceMap: true
+instrument: true
+branches: 70
+functions: 70
+lines: 70
+statements: 70
